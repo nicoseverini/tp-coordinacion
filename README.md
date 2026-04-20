@@ -1,81 +1,90 @@
-# Trabajo Práctico - Coordinación
+## Problemas encontrados y soluciones
 
-En este trabajo se busca familiarizar a los estudiantes con los desafíos de la coordinación del trabajo y el control de la complejidad en sistemas distribuidos. Para tal fin se provee un esqueleto de un sistema de control de stock de una verdulería y un conjunto de escenarios de creciente grado de complejidad y distribución que demandarán mayor sofisticación en la comunicación de las partes involucradas.
+### Coordinación entre instancias de sum
 
-## Ejecución
+**Problema**  
+Las instancias de `sum` consumen de la misma working queue. Cuando un cliente enviaba un EOF, solo una lo recibía y el resto no se enteraba de que el flujo había terminado.
 
-`make up` : Inicia los contenedores del sistema y comienza a seguir los logs de todos ellos en un solo flujo de salida.
+Esto hacía que algunas instancias no enviaran sus resultados parciales a `aggregation`, dejando resultados incompletos.
 
-`make down`:   Detiene los contenedores y libera los recursos asociados.
+**Solución**  
+Se agregó un exchange de control (`SUM_CONTROL_EXCHANGE`).
 
-`make logs`: Sigue los logs de todos los contenedores en un solo flujo de salida.
+Cuando una instancia de `sum` recibe un EOF:
+- lo procesa
+- publica un mensaje de control (`MessageTypeSumEOF`) en el exchange
 
-`make test`: Inicia los contenedores del sistema, espera a que los clientes finalicen, compara los resultados con una ejecución serial y detiene los contenederes.
+El resto de las instancias están suscritas (en una goroutine), así que también reciben ese EOF y ejecutan su lógica de cierre.
 
-`make switch`: Permite alternar rápidamente entre los archivos de docker compose de los distintos escenarios provistos.
+**Resultado**  
+Todas las instancias quedan sincronizadas para un mismo `task` y cada una envía sus parciales, evitando que falten datos en `aggregation`.
 
-## Elementos del sistema objetivo
+---
 
-![ ](./imgs/diagrama_de_robustez.jpg  "Diagrama de Robustez")
-*Fig. 1: Diagrama de Robustez*
+### Distribución consistente hacia aggregation
 
-### Client
+**Problema**  
+La misma fruta podía terminar en distintos aggregators, generando tops inconsistentes.
 
-Lee un archivo de entrada y envía por TCP/IP pares (fruta, cantidad) al sistema.
-Cuando finaliza el envío de datos, aguarda un top de pares (fruta, cantidad) y vuelca el resultado en un archivo de salida csv.
-El criterio y tamaño del top dependen de la configuración del sistema. Por defecto se trata de un top 3 de frutas de acuerdo a la cantidad total almacenada.
+**Solución**  
+Se implementó un particionamiento determinístico en `sum`:
 
-### Gateway
+```go
+partition = hash(fruit) % aggregationCount
+```
+Así, cada fruta siempre cae en el mismo aggregator para un `taskId`.
 
-Es el punto de entrada y salida del sistema. Intercambia mensajes con los clientes y las colas internas utilizando distintos protocolos.
+---
 
-### Sum
- 
-Recibe pares  (fruta, cantidad) y aplica la función Suma de la clase `FruitItem`. Por defecto esa suma es la canónica para los números enteros, ej:
+### Coordinación en join
 
-`("manzana", 5) + ("manzana", 8) = ("manzana", 13)`
+**Problema**  
+`join` no puede emitir el resultado final hasta recibir todos los EOF de los aggregators.
 
-Pero su implementación podría modificarse.
-Cuando se detecta el final de la ingesta de datos envía los pares (fruta, cantidad) totales a los Aggregators.
+**Solución**  
+Se cuenta cuántos EOF llegaron por `taskId` y se compara con `aggregationAmount`.  
+Solo cuando están todos:
 
-### Aggregator
+- se arma el resultado final
+- se envía el top K
 
-Consolida los datos de las distintas instancias de Sum.
-Cuando se detecta el final de la ingesta, se calcula un top parcial y se envía esa información al Joiner.
+Es la una idea parecida a la de coordinación que en `sum`, pero aplicada al final del pipeline.
 
-### Joiner
+---
+    
+### Flush prematuro en sum
 
-Recibe tops parciales de las instancias del Aggregator.
-Cuando se detecta el final de la ingesta, se envía el top final hacia el gateway para ser entregado al cliente.
+**Problema**  
+Un `sum` podía recibir el EOF antes de terminar de procesar mensajes pendientes, lo que llevaba a resultados incompletos.
 
-## Limitaciones del esqueleto provisto
+Además hay un caso borde importante:  
+el EOF puede llegar justo después de que el último mensaje hace `pendingMessages--`, o incluso mientras todavía hay procesamiento en paralelo.
 
-La implementación base respeta la división de responsabilidades de los distintos controles y hace uso de la clase `FruitItem` como un elemento opaco, sin asumir la implementación de las funciones de Suma y Comparación.
+**Solución**  
+Se maneja estado por `taskId`:
 
-No obstante, esta implementación no cubre los objetivos buscados tal y como es presentada. Entre sus falencias puede destactarse que:
+- `pendingMessages`: mensajes en procesamiento
+- `eofReceived`: si ya llegó el EOF
+- `flushDone`: evita ejecutar flush más de una vez
 
- - No se implementa la interfaz del middleware. 
- - No se dividen los flujos de datos de los clientes más allá del Gateway, por lo que no se es capaz de resolver múltiples consultas concurrentemente.
- - No se implementan mecanismos de sincronización que permitan escalar los controles Sum y Aggregator. En particular:
-   - Las instancias de Sum se dividen el trabajo, pero solo una de ellas recibe la notificación de finalización en la ingesta de datos.
-   - Las instancias de Sum realizan _broadcast_ a todas las instancias de Aggregator, en lugar de agrupar los datos por algún criterio y evitar procesamiento redundante.
-  - No se maneja la señal SIGTERM, con la salvedad de los clientes y el Gateway.
+El flush se hace solo cuando:
 
-## Condiciones de Entrega
+- llegó el EOF
+- no quedan mensajes pendientes
 
-El código de este repositorio se agrupa en dos carpetas, una para Python y otra para Golang. Los estudiantes deberán elegir **sólo uno** de estos lenguajes y realizar una implementación que funcione correctamente ante cambios en la multiplicidad de los controles (archivo de docker compose), los archivos de entrada y las implementaciones de las funciones de Suma y Comparación del `FruitItem`.
+La clave es no depender del orden de llegada, sino del estado.
 
-![ ](./imgs/mutabilidad.jpg  "Mutabilidad de Elementos")
-*Fig. 2: Elementos mutables e inmutables*
+Se re-evalúa la condición de flush en dos momentos:
 
-A modo de referencia, en la *Figura 2* se marcan en tonos oscuros los elementos que los estudiantes no deben alterar y en tonos claros aquellos sobre los que tienen libertad de decisión.
-Al momento de la evaluación y ejecución de las pruebas se **descartarán** o **reemplazarán** :
+- cuando termina un mensaje (`pendingMessages--`)
+- cuando llega el EOF (`eofReceived = true`)
 
-- Los archivos de entrada de la carpeta `datasets`.
-- El archivo docker compose principal y los de la carpeta `scenarios`.
-- Todos los archivos Dockerfile.
-- Todo el código del cliente.
-- Todo el código del gateway, salvo `message_handler`.
-- La implementación del protocolo de comunicación externo y `FruitItem`.
+Esto cubre el caso donde el EOF llega justo después del último mensaje.  
+Si todavía no había llegado el EOF, no pasa nada. Cuando llega, se vuelve a evaluar y flushea correctamente.
 
-Redactar un breve informe explicando el modo en que se coordinan las instancias de Sum y Aggregation, así como el modo en el que el sistema escala respecto a los clientes y a la cantidad de controles.
+**Resultado**
+
+- no hay flush prematuro
+- no quedan tareas colgadas
+- el resultado se emite recién cuando todo fue procesado  
+
