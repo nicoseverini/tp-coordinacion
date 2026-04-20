@@ -35,9 +35,11 @@ type Sum struct {
 	controlPublisher middleware.Middleware
 	controlConsumer  middleware.Middleware
 
-	stateMu      sync.Mutex
-	fruitItemMap map[string]map[string]fruititem.FruitItem
-	eofProcessed map[string]bool
+	stateMu         sync.Mutex
+	fruitItemMap    map[string]map[string]fruititem.FruitItem
+	pendingMessages map[string]int
+	eofReceived     map[string]bool
+	flushDone       map[string]bool
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -94,7 +96,9 @@ func NewSum(config SumConfig) (*Sum, error) {
 		controlPublisher: controlPublisher,
 		controlConsumer:  controlConsumer,
 		fruitItemMap:     map[string]map[string]fruititem.FruitItem{},
-		eofProcessed:     map[string]bool{},
+		pendingMessages:  map[string]int{},
+		eofReceived:      map[string]bool{},
+		flushDone:        map[string]bool{},
 	}, nil
 }
 
@@ -178,13 +182,57 @@ func (sum *Sum) handleControlEOF(taskId string, senderID *int) {
 }
 
 func (sum *Sum) handleEOF(taskId string, publishControl bool) error {
-	fruitMap, shouldProcess := sum.startTaskEOF(taskId)
-	if !shouldProcess {
-		return nil
+	shouldFlush := false
+	sum.stateMu.Lock()
+	if !sum.flushDone[taskId] {
+		sum.eofReceived[taskId] = true
+		shouldFlush = sum.tryMarkFlushLocked(taskId)
+	}
+	sum.stateMu.Unlock()
+
+	if publishControl {
+		controlMessage, err := inner.SerializeControlEOFMessage(taskId, sum.id)
+		if err != nil {
+			slog.Debug("While serializing control EOF message", "err", err)
+			return err
+		}
+		if err := sum.controlPublisher.Send(*controlMessage); err != nil {
+			slog.Debug("While publishing control EOF message", "err", err)
+			return err
+		}
 	}
 
-	slog.Info("Received End Of Records message", "taskId", taskId)
+	if shouldFlush {
+		return sum.flush(taskId)
+	}
 
+	return nil
+}
+
+func (sum *Sum) tryMarkFlushLocked(taskId string) bool {
+	if sum.flushDone[taskId] {
+		return false
+	}
+	if !sum.eofReceived[taskId] {
+		return false
+	}
+	if sum.pendingMessages[taskId] != 0 {
+		return false
+	}
+	sum.flushDone[taskId] = true
+	return true
+}
+
+func (sum *Sum) flush(taskId string) error {
+	sum.stateMu.Lock()
+	fruitMap := sum.fruitItemMap[taskId]
+	delete(sum.fruitItemMap, taskId)
+	delete(sum.pendingMessages, taskId)
+	delete(sum.eofReceived, taskId)
+	delete(sum.flushDone, taskId)
+	sum.stateMu.Unlock()
+
+	slog.Info("Flushing task", "taskId", taskId)
 	for _, fruitRecord := range fruitMap {
 		partition := sum.partitionForFruit(fruitRecord.Fruit)
 		message, err := inner.SerializeMessage(taskId, []fruititem.FruitItem{fruitRecord})
@@ -209,34 +257,7 @@ func (sum *Sum) handleEOF(taskId string, publishControl bool) error {
 			return err
 		}
 	}
-
-	if publishControl {
-		controlMessage, err := inner.SerializeControlEOFMessage(taskId, sum.id)
-		if err != nil {
-			slog.Debug("While serializing control EOF message", "err", err)
-			return err
-		}
-		if err := sum.controlPublisher.Send(*controlMessage); err != nil {
-			slog.Debug("While publishing control EOF message", "err", err)
-			return err
-		}
-	}
-
 	return nil
-}
-
-func (sum *Sum) startTaskEOF(taskId string) (map[string]fruititem.FruitItem, bool) {
-	sum.stateMu.Lock()
-	defer sum.stateMu.Unlock()
-
-	if sum.eofProcessed[taskId] {
-		return nil, false
-	}
-	sum.eofProcessed[taskId] = true
-
-	fruitMap := sum.fruitItemMap[taskId]
-	delete(sum.fruitItemMap, taskId)
-	return fruitMap, true
 }
 
 func (sum *Sum) partitionForFruit(fruit string) int {
@@ -247,11 +268,13 @@ func (sum *Sum) partitionForFruit(fruit string) int {
 
 func (sum *Sum) handleDataMessage(taskId string, fruitRecords []fruititem.FruitItem) error {
 	sum.stateMu.Lock()
-	defer sum.stateMu.Unlock()
 
-	if sum.eofProcessed[taskId] {
+	if sum.flushDone[taskId] {
+		sum.stateMu.Unlock()
 		return nil
 	}
+	sum.pendingMessages[taskId]++
+
 	if _, ok := sum.fruitItemMap[taskId]; !ok {
 		sum.fruitItemMap[taskId] = map[string]fruititem.FruitItem{}
 	}
@@ -263,6 +286,14 @@ func (sum *Sum) handleDataMessage(taskId string, fruitRecords []fruititem.FruitI
 		} else {
 			sum.fruitItemMap[taskId][fruitRecord.Fruit] = fruitRecord
 		}
+	}
+
+	sum.pendingMessages[taskId]--
+	shouldFlush := sum.tryMarkFlushLocked(taskId)
+	sum.stateMu.Unlock()
+
+	if shouldFlush {
+		return sum.flush(taskId)
 	}
 	return nil
 }
