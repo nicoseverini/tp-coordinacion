@@ -103,7 +103,7 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(taskId string) error {
 	}
 
 	fruitTopRecords := aggregation.buildFruitTop(fruitMap)
-	message, err := inner.SerializeMessage(taskId, fruitTopRecords)
+	message, err := inner.SerializeResultMessage(taskId, fruitTopRecords)
 	if err != nil {
 		slog.Debug("While serializing top message", "err", err)
 		return err
@@ -113,8 +113,7 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(taskId string) error {
 		return err
 	}
 
-	var eofMessage []fruititem.FruitItem
-	message, err = inner.SerializeMessage(taskId, eofMessage)
+	message, err = inner.SerializeEOFMessage(taskId)
 	if err != nil {
 		slog.Debug("While serializing EOF message", "err", err)
 		return err

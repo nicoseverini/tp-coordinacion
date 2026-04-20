@@ -40,9 +40,12 @@ func (messageHandler *MessageHandler) SerializeEOFMessage() (*middleware.Message
 }
 
 func (messageHandler *MessageHandler) DeserializeResultMessage(message *middleware.Message) ([]fruititem.FruitItem, error) {
-	taskId, fruitRecords, _, err := inner.DeserializeMessage(message)
+	taskId, fruitRecords, _, messageType, _, err := inner.DeserializeMessageWithMetadata(message)
 	if err != nil {
 		return nil, err
+	}
+	if messageType != inner.MessageTypeResult {
+		return nil, nil
 	}
 	//slog.Info("Received message", "taskId", taskId, "handlerId", messageHandler.id)
 

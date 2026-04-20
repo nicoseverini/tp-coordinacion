@@ -18,6 +18,8 @@ type QueryResult struct {
 
 const (
 	MessageTypeData   = "data"
+	MessageTypeEOF    = "eof"
+	MessageTypeResult = "result"
 	MessageTypeSumEOF = "sum_eof"
 )
 
@@ -35,6 +37,15 @@ func deserializeJson(message []byte) ([]interface{}, error) {
 
 func SerializeMessage(taskId string, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
 	return serializeMessage(taskId, fruitRecords, MessageTypeData, nil, nil)
+}
+
+func SerializeResultMessage(taskId string, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
+	return serializeMessage(taskId, fruitRecords, MessageTypeResult, nil, nil)
+}
+
+func SerializeEOFMessage(taskId string) (*middleware.Message, error) {
+	isEOF := true
+	return serializeMessage(taskId, nil, MessageTypeEOF, &isEOF, nil)
 }
 
 func SerializeControlEOFMessage(taskId string, senderID int) (*middleware.Message, error) {
@@ -104,6 +115,9 @@ func DeserializeMessageWithMetadata(message *middleware.Message) (string, []frui
 	isEOF := len(fruitRecords) == 0
 	if queryResult.EOF != nil {
 		isEOF = *queryResult.EOF
+	}
+	if queryResult.Type == MessageTypeEOF {
+		isEOF = true
 	}
 
 	messageType := queryResult.Type

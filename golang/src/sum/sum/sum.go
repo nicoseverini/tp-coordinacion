@@ -198,7 +198,7 @@ func (sum *Sum) handleEOF(taskId string, publishControl bool) error {
 		}
 	}
 
-	eofMessage, err := inner.SerializeMessage(taskId, nil)
+	eofMessage, err := inner.SerializeEOFMessage(taskId)
 	if err != nil {
 		slog.Debug("While serializing EOF to aggregation", "err", err)
 		return err
