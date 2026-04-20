@@ -9,9 +9,17 @@ import (
 )
 
 type QueryResult struct {
-	TaskID string          `json:"query_id"`
-	Data   [][]interface{} `json:"data"`
+	Type     string          `json:"type,omitempty"`
+	TaskID   string          `json:"query_id"`
+	Data     [][]interface{} `json:"data"`
+	EOF      *bool           `json:"eof,omitempty"`
+	SenderID *int            `json:"sender_id,omitempty"`
 }
+
+const (
+	MessageTypeData   = "data"
+	MessageTypeSumEOF = "sum_eof"
+)
 
 func serializeJson(message []interface{}) ([]byte, error) {
 	return json.Marshal(message)
@@ -26,6 +34,15 @@ func deserializeJson(message []byte) ([]interface{}, error) {
 }
 
 func SerializeMessage(taskId string, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
+	return serializeMessage(taskId, fruitRecords, MessageTypeData, nil, nil)
+}
+
+func SerializeControlEOFMessage(taskId string, senderID int) (*middleware.Message, error) {
+	isEOF := true
+	return serializeMessage(taskId, nil, MessageTypeSumEOF, &isEOF, &senderID)
+}
+
+func serializeMessage(taskId string, fruitRecords []fruititem.FruitItem, messageType string, eof *bool, senderID *int) (*middleware.Message, error) {
 	var data [][]interface{}
 	for _, fruitRecord := range fruitRecords {
 		datum := []interface{}{
@@ -36,8 +53,11 @@ func SerializeMessage(taskId string, fruitRecords []fruititem.FruitItem) (*middl
 	}
 
 	queryResult := QueryResult{
-		TaskID: taskId,
-		Data:   data,
+		Type:     messageType,
+		TaskID:   taskId,
+		Data:     data,
+		EOF:      eof,
+		SenderID: senderID,
 	}
 
 	body, err := json.Marshal(queryResult)
@@ -50,31 +70,46 @@ func SerializeMessage(taskId string, fruitRecords []fruititem.FruitItem) (*middl
 }
 
 func DeserializeMessage(message *middleware.Message) (string, []fruititem.FruitItem, bool, error) {
+	taskID, fruitRecords, isEOF, _, _, err := DeserializeMessageWithMetadata(message)
+	return taskID, fruitRecords, isEOF, err
+}
+
+func DeserializeMessageWithMetadata(message *middleware.Message) (string, []fruititem.FruitItem, bool, string, *int, error) {
 	var queryResult QueryResult
 
 	if err := json.Unmarshal([]byte(message.Body), &queryResult); err != nil {
-		return "", nil, false, err
+		return "", nil, false, "", nil, err
 	}
 
 	var fruitRecords []fruititem.FruitItem
 	for _, datum := range queryResult.Data {
 		if len(datum) != 2 {
-			return "", nil, false, errors.New("Datum is not an array")
+			return "", nil, false, "", nil, errors.New("Datum is not an array")
 		}
 
 		fruit, ok := datum[0].(string)
 		if !ok {
-			return "", nil, false, errors.New("Datum is not a (fruit, amount) pair")
+			return "", nil, false, "", nil, errors.New("Datum is not a (fruit, amount) pair")
 		}
 
 		fruitAmount, ok := datum[1].(float64)
 		if !ok {
-			return "", nil, false, errors.New("Datum is not a (fruit, amount) pair")
+			return "", nil, false, "", nil, errors.New("Datum is not a (fruit, amount) pair")
 		}
 
 		fruitRecord := fruititem.FruitItem{Fruit: fruit, Amount: uint32(fruitAmount)}
 		fruitRecords = append(fruitRecords, fruitRecord)
 	}
 
-	return queryResult.TaskID, fruitRecords, len(fruitRecords) == 0, nil
+	isEOF := len(fruitRecords) == 0
+	if queryResult.EOF != nil {
+		isEOF = *queryResult.EOF
+	}
+
+	messageType := queryResult.Type
+	if messageType == "" {
+		messageType = MessageTypeData
+	}
+
+	return queryResult.TaskID, fruitRecords, isEOF, messageType, queryResult.SenderID, nil
 }

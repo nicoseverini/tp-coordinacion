@@ -27,6 +27,8 @@ type Aggregation struct {
 	inputExchange middleware.Middleware
 	fruitItemMap  map[string]map[string]fruititem.FruitItem
 	topSize       int
+	sumAmount     int
+	eofCount      map[string]int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -52,6 +54,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		inputExchange: inputExchange,
 		fruitItemMap:  map[string]map[string]fruititem.FruitItem{},
 		topSize:       config.TopSize,
+		sumAmount:     config.SumAmount,
+		eofCount:      map[string]int{},
 	}, nil
 }
 
@@ -71,8 +75,17 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 	}
 
 	if isEof {
-		if err := aggregation.handleEndOfRecordsMessage(taskId); err != nil {
-			slog.Error("While handling end of record message", "err", err)
+		aggregation.eofCount[taskId]++
+		slog.Info("EOF recibido",
+			"taskId", taskId,
+			"count", aggregation.eofCount[taskId],
+			"expected", aggregation.sumAmount,
+		)
+		if aggregation.eofCount[taskId] == aggregation.sumAmount {
+			if err := aggregation.handleEndOfRecordsMessage(taskId); err != nil {
+				slog.Error("While handling end of record message", "err", err)
+			}
+			delete(aggregation.eofCount, taskId)
 		}
 		return
 	}
@@ -110,6 +123,7 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(taskId string) error {
 		slog.Debug("While sending EOF message", "err", err)
 		return err
 	}
+	delete(aggregation.fruitItemMap, taskId)
 	return nil
 }
 
