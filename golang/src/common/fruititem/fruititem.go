@@ -5,6 +5,10 @@ type FruitItem struct {
 	Amount uint32
 }
 
+type ByFruit map[string]FruitItem
+
+type ByTask map[string]ByFruit
+
 func (fruitItem FruitItem) Sum(other FruitItem) FruitItem {
 	return FruitItem{Fruit: fruitItem.Fruit, Amount: fruitItem.Amount + other.Amount}
 }

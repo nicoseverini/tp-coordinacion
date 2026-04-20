@@ -25,7 +25,7 @@ type AggregationConfig struct {
 type Aggregation struct {
 	outputQueue   middleware.Middleware
 	inputExchange middleware.Middleware
-	fruitItemMap  map[string]map[string]fruititem.FruitItem
+	fruitItemMap  fruititem.ByTask
 	topSize       int
 	sumAmount     int
 	eofCount      map[string]int
@@ -52,7 +52,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	return &Aggregation{
 		outputQueue:   outputQueue,
 		inputExchange: inputExchange,
-		fruitItemMap:  map[string]map[string]fruititem.FruitItem{},
+		fruitItemMap:  fruititem.ByTask{},
 		topSize:       config.TopSize,
 		sumAmount:     config.SumAmount,
 		eofCount:      map[string]int{},
@@ -60,12 +60,15 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 }
 
 func (aggregation *Aggregation) Run() {
-	aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	err := aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		aggregation.handleMessage(msg, ack, nack)
 	})
+	if err != nil {
+		slog.Error("While consuming input exchange", "err", err)
+	}
 }
 
-func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
+func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), _ func()) {
 	defer ack()
 
 	taskId, fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
@@ -76,7 +79,7 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 
 	if isEof {
 		aggregation.eofCount[taskId]++
-		slog.Info("EOF recibido",
+		slog.Info("EOF received",
 			"taskId", taskId,
 			"count", aggregation.eofCount[taskId],
 			"expected", aggregation.sumAmount,
@@ -127,17 +130,7 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(taskId string) error {
 }
 
 func (aggregation *Aggregation) handleDataMessage(taskId string, fruitRecords []fruititem.FruitItem) {
-	if _, ok := aggregation.fruitItemMap[taskId]; !ok {
-		aggregation.fruitItemMap[taskId] = map[string]fruititem.FruitItem{}
-	}
-	for _, fruitRecord := range fruitRecords {
-		current, exists := aggregation.fruitItemMap[taskId][fruitRecord.Fruit]
-		if exists {
-			aggregation.fruitItemMap[taskId][fruitRecord.Fruit] = current.Sum(fruitRecord)
-		} else {
-			aggregation.fruitItemMap[taskId][fruitRecord.Fruit] = fruitRecord
-		}
-	}
+	fruititem.AccumulateByTask(aggregation.fruitItemMap, taskId, fruitRecords)
 }
 
 func (aggregation *Aggregation) buildFruitTop(fruitMap map[string]fruititem.FruitItem) []fruititem.FruitItem {

@@ -23,18 +23,6 @@ const (
 	MessageTypeSumEOF = "sum_eof"
 )
 
-func serializeJson(message []interface{}) ([]byte, error) {
-	return json.Marshal(message)
-}
-
-func deserializeJson(message []byte) ([]interface{}, error) {
-	var data []interface{}
-	if err := json.Unmarshal(message, &data); err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
 func SerializeMessage(taskId string, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
 	return serializeMessage(taskId, fruitRecords, MessageTypeData, nil, nil)
 }
@@ -95,17 +83,17 @@ func DeserializeMessageWithMetadata(message *middleware.Message) (string, []frui
 	var fruitRecords []fruititem.FruitItem
 	for _, datum := range queryResult.Data {
 		if len(datum) != 2 {
-			return "", nil, false, "", nil, errors.New("Datum is not an array")
+			return "", nil, false, "", nil, errors.New("datum is not an array")
 		}
 
 		fruit, ok := datum[0].(string)
 		if !ok {
-			return "", nil, false, "", nil, errors.New("Datum is not a (fruit, amount) pair")
+			return "", nil, false, "", nil, errors.New("datum is not a (fruit, amount) pair")
 		}
 
 		fruitAmount, ok := datum[1].(float64)
 		if !ok {
-			return "", nil, false, "", nil, errors.New("Datum is not a (fruit, amount) pair")
+			return "", nil, false, "", nil, errors.New("datum is not a (fruit, amount) pair")
 		}
 
 		fruitRecord := fruititem.FruitItem{Fruit: fruit, Amount: uint32(fruitAmount)}

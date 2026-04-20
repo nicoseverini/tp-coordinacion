@@ -28,9 +28,8 @@ type Join struct {
 	aggregationAmount int
 	topSize           int
 
-	stateMu   sync.Mutex
-	partialBy map[string]map[string]fruititem.FruitItem
-	eofCount  map[string]int
+	stateMu sync.Mutex
+	tasks   map[string]*JoinTask
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -43,7 +42,7 @@ func NewJoin(config JoinConfig) (*Join, error) {
 
 	outputQueue, err := middleware.CreateQueueMiddleware(config.OutputQueue, connSettings)
 	if err != nil {
-		inputQueue.Close()
+		_ = inputQueue.Close()
 		return nil, err
 	}
 
@@ -52,8 +51,7 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		outputQueue:       outputQueue,
 		aggregationAmount: config.AggregationAmount,
 		topSize:           config.TopSize,
-		partialBy:         map[string]map[string]fruititem.FruitItem{},
-		eofCount:          map[string]int{},
+		tasks:             map[string]*JoinTask{},
 	}, nil
 }
 
@@ -69,7 +67,7 @@ func (join *Join) Run() {
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	queryID, fruitRecords, isEof, messageType, _, err := inner.DeserializeMessageWithMetadata(&msg)
+	queryID, fruitRecords, isEOF, messageType, _, err := inner.DeserializeMessageWithMetadata(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		_ = nack
@@ -80,7 +78,7 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 		return
 	}
 
-	if isEof || messageType == inner.MessageTypeEOF {
+	if isEOF || messageType == inner.MessageTypeEOF {
 		join.handleEOF(queryID)
 		return
 	}
@@ -92,34 +90,37 @@ func (join *Join) handleData(queryID string, fruitRecords []fruititem.FruitItem)
 	join.stateMu.Lock()
 	defer join.stateMu.Unlock()
 
-	if _, ok := join.partialBy[queryID]; !ok {
-		join.partialBy[queryID] = map[string]fruititem.FruitItem{}
+	task := join.getOrCreateTaskLocked(queryID)
+	if task.Completed {
+		return
 	}
-	for _, fruitRecord := range fruitRecords {
-		current, exists := join.partialBy[queryID][fruitRecord.Fruit]
-		if exists {
-			join.partialBy[queryID][fruitRecord.Fruit] = current.Sum(fruitRecord)
-		} else {
-			join.partialBy[queryID][fruitRecord.Fruit] = fruitRecord
-		}
-	}
+	fruititem.AccumulateByFruit(task.Fruits, fruitRecords)
 }
 
 func (join *Join) handleEOF(queryID string) {
 	join.stateMu.Lock()
-
-	join.eofCount[queryID]++
-	received := join.eofCount[queryID]
-	expected := join.aggregationAmount
-
-	join.stateMu.Unlock()
-
-	slog.Info("Join EOF recibido", "queryID", queryID, "count", received, "expected", expected)
-	if received < expected {
+	task := join.getOrCreateTaskLocked(queryID)
+	if task.Completed {
+		join.stateMu.Unlock()
 		return
 	}
 
-	top := join.finishTask(queryID)
+	task.EOFCount++
+	received := task.EOFCount
+	expected := join.aggregationAmount
+	if received < expected {
+		join.stateMu.Unlock()
+		slog.Info("Join EOF received", "queryID", queryID, "count", received, "expected", expected)
+		return
+	}
+
+	task.Completed = true
+	top := buildTopK(task.Fruits, join.topSize)
+	task.Fruits = nil
+	join.stateMu.Unlock()
+
+	slog.Info("Join EOF received", "queryID", queryID, "count", received, "expected", expected)
+
 	resultMsg, err := inner.SerializeResultMessage(queryID, top)
 	if err != nil {
 		slog.Error("While serializing final result", "queryID", queryID, "err", err)
@@ -131,19 +132,16 @@ func (join *Join) handleEOF(queryID string) {
 	}
 }
 
-func (join *Join) finishTask(queryID string) []fruititem.FruitItem {
-	join.stateMu.Lock()
-	defer join.stateMu.Unlock()
-
-	fruitMap := join.partialBy[queryID]
-
-	delete(join.partialBy, queryID)
-	delete(join.eofCount, queryID)
-
-	return buildTopK(fruitMap, join.topSize)
+func (join *Join) getOrCreateTaskLocked(queryID string) *JoinTask {
+	task, ok := join.tasks[queryID]
+	if !ok {
+		task = NewJoinTask()
+		join.tasks[queryID] = task
+	}
+	return task
 }
 
-func buildTopK(fruitMap map[string]fruititem.FruitItem, k int) []fruititem.FruitItem {
+func buildTopK(fruitMap fruititem.ByFruit, k int) []fruititem.FruitItem {
 	if len(fruitMap) == 0 {
 		return nil
 	}
@@ -155,11 +153,11 @@ func buildTopK(fruitMap map[string]fruititem.FruitItem, k int) []fruititem.Fruit
 	sort.SliceStable(fruitItems, func(i, j int) bool {
 		return fruitItems[j].Less(fruitItems[i])
 	})
-	finalTopSize := min(k, len(fruitItems))
+	finalTopSize := minInt(k, len(fruitItems))
 	return fruitItems[:finalTopSize]
 }
 
-func min(a, b int) int {
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}
